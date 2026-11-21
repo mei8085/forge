@@ -1,6 +1,29 @@
 Forge ChangeLog
 ===============
 
+## 1.4.4 - Unreleased
+
+### Security
+- **HIGH**: TLS peer certificate purpose and identity are not checked.
+  - `tls.createConnection()` verified the peer certificate chain but never
+    checked that the end entity certificate is valid for the TLS role the peer
+    is playing, nor that a client is talking to the host name it intended. A
+    certificate that chains to a trusted CA but has an `extKeyUsage` extension
+    without `serverAuth` (for a server) or `clientAuth` (for a client) was
+    accepted, and a client could be presented with a trusted certificate issued
+    to a different name. The connection role, name matching, certificate chain
+    and `serverAuth`/`clientAuth` purpose now converge into one trust decision:
+    the leaf certificate's purpose is enforced by default per RFC 5280
+    4.2.1.12 (an absent `extKeyUsage` extension still allows any purpose), and
+    host name verification against `subjectAltName` (with a common-name
+    fallback, RFC 6125) can be enabled with
+    `verifyOptions.checkHostName: true`, matching against `virtualHost`.
+    Purpose enforcement can be disabled with
+    `verifyOptions.extendedKeyUsage: false`. The application `verify` callback
+    still runs after these checks and retains its existing ability to accept or
+    reject; legitimate one-way and mutual TLS handshakes keep their existing
+    API behavior.
+
 ## 1.4.3 - 2026-11-03
 
 ### Security

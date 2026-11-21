@@ -158,8 +158,16 @@ require('../../lib/util');
           keyEncipherment: true,
           dataEncipherment: true
         }, {
+          // mark each cert for the TLS role it will play
+          name: 'extKeyUsage',
+          serverAuth: cn === 'server',
+          clientAuth: cn === 'client'
+        }, {
           name: 'subjectAltName',
           altNames: [{
+            type: 2, // DNS
+            value: cn
+          }, {
             type: 6, // URI
             value: 'https://myuri.com/webid#me'
           }]
@@ -783,6 +791,519 @@ require('../../lib/util');
         ASSERT.equal(log.errors.length, 1);
         ASSERT.ok(/ServerHello/.test(log.errors[0]), log.errors[0]);
       });
+    });
+
+    // identity and certificate purpose (serverAuth/clientAuth) verification
+    describe('peer identity and key purpose', function() {
+      // build a self-signed cert with the given CN, SANs and extKeyUsage
+      function makeCert(options) {
+        options = options || {};
+        var keys = forge.pki.rsa.generateKeyPair(512);
+        var cert = forge.pki.createCertificate();
+        cert.publicKey = keys.publicKey;
+        cert.serialNumber = '01';
+        cert.validity.notBefore = new Date();
+        cert.validity.notAfter = new Date();
+        cert.validity.notAfter.setFullYear(
+          cert.validity.notBefore.getFullYear() + 1);
+        var attrs = [{name: 'commonName', value: options.cn || 'server'}];
+        cert.setSubject(attrs);
+        cert.setIssuer(attrs);
+        var extensions = [];
+        if(options.eku) {
+          extensions.push({
+            name: 'extKeyUsage',
+            serverAuth: options.eku.serverAuth === true,
+            clientAuth: options.eku.clientAuth === true
+          });
+        }
+        if(options.altNames) {
+          extensions.push({
+            name: 'subjectAltName',
+            altNames: options.altNames
+          });
+        }
+        if(extensions.length) {
+          cert.setExtensions(extensions);
+        }
+        cert.sign(keys.privateKey);
+        return {
+          cert: forge.pki.certificateToPem(cert),
+          key: forge.pki.privateKeyToPem(keys.privateKey)
+        };
+      }
+
+      var dnsName = function(value) {
+        return {type: 2, value: value};
+      };
+      var ipName = function(value) {
+        return {type: 7, ip: value, value: forge.util.bytesFromIP(value)};
+      };
+
+      // run a one-way TLS handshake; client trusts the server cert
+      function runHandshake(server, clientOptions) {
+        clientOptions = clientOptions || {};
+        var end = {};
+        var log = {
+          connected: false,
+          errors: [],
+          alerts: [],
+          verified: []
+        };
+        end.client = forge.tls.createConnection({
+          server: false,
+          caStore: [server.cert],
+          virtualHost: clientOptions.virtualHost || null,
+          verifyOptions: clientOptions.verifyOptions,
+          verify: function(c, verified, depth, certs) {
+            log.verified.push([verified, depth, certs.length]);
+            return clientOptions.verify ?
+              clientOptions.verify(verified, depth, certs) : verified;
+          },
+          connected: function() {
+            log.connected = true;
+          },
+          getCertificate: function() {
+            return server.cert;
+          },
+          getPrivateKey: function() {
+            return server.key;
+          },
+          tlsDataReady: function(c) {
+            end.server.process(c.tlsData.getBytes());
+          },
+          dataReady: function() {},
+          closed: function() {},
+          error: function(c, error) {
+            log.errors.push(error.message);
+            log.alerts.push(error.alert && error.alert.description);
+          }
+        });
+        end.server = forge.tls.createConnection({
+          server: true,
+          getCertificate: function() {
+            return server.cert;
+          },
+          getPrivateKey: function() {
+            return server.key;
+          },
+          connected: function() {},
+          tlsDataReady: function(c) {
+            end.client.process(c.tlsData.getBytes());
+          },
+          dataReady: function() {},
+          closed: function() {},
+          error: function() {}
+        });
+        end.client.handshake();
+        return log;
+      }
+
+      // run a mutual TLS handshake; each side trusts the other's cert
+      function runMutualHandshake(serverData, clientData, options) {
+        options = options || {};
+        var end = {};
+        var log = {connected: false, errors: [], alerts: []};
+        end.client = forge.tls.createConnection({
+          server: false,
+          caStore: [serverData.cert],
+          virtualHost: options.virtualHost || null,
+          verifyOptions: options.clientVerifyOptions,
+          verify: function(c, verified) {
+            return verified;
+          },
+          connected: function() {
+            log.connected = true;
+          },
+          getCertificate: function() {
+            return clientData.cert;
+          },
+          getPrivateKey: function() {
+            return clientData.key;
+          },
+          tlsDataReady: function(c) {
+            end.server.process(c.tlsData.getBytes());
+          },
+          dataReady: function() {},
+          closed: function() {},
+          error: function(c, error) {
+            log.errors.push('client: ' + error.message);
+            log.alerts.push(error.alert && error.alert.description);
+          }
+        });
+        end.server = forge.tls.createConnection({
+          server: true,
+          caStore: [clientData.cert],
+          verifyClient: true,
+          verifyOptions: options.serverVerifyOptions,
+          verify: function(c, verified) {
+            return verified;
+          },
+          connected: function() {},
+          getCertificate: function() {
+            return serverData.cert;
+          },
+          getPrivateKey: function() {
+            return serverData.key;
+          },
+          tlsDataReady: function(c) {
+            end.client.process(c.tlsData.getBytes());
+          },
+          dataReady: function() {},
+          closed: function() {},
+          error: function(c, error) {
+            log.errors.push('server: ' + error.message);
+            log.alerts.push(error.alert && error.alert.description);
+          }
+        });
+        end.client.handshake();
+        return log;
+      }
+
+      it('accepts a server certificate valid for serverAuth', function() {
+        var server = makeCert({
+          cn: 'example.com',
+          eku: {serverAuth: true},
+          altNames: [dnsName('example.com')]
+        });
+        var log = runHandshake(server, {virtualHost: 'example.com',
+          verifyOptions: {checkHostName: true}});
+        ASSERT.equal(log.connected, true);
+        ASSERT.deepEqual(log.errors, []);
+      });
+
+      it('accepts a certificate without an extKeyUsage extension', function() {
+        // RFC 5280: absent EKU means any purpose is allowed
+        var server = makeCert({cn: 'server'});
+        var log = runHandshake(server);
+        ASSERT.equal(log.connected, true);
+        ASSERT.deepEqual(log.errors, []);
+      });
+
+      it('rejects a server certificate that only allows clientAuth',
+        function() {
+          var server = makeCert({
+            cn: 'server',
+            eku: {clientAuth: true}
+          });
+          var log = runHandshake(server);
+          ASSERT.equal(log.connected, false);
+          ASSERT.equal(log.errors.length, 1);
+          ASSERT.equal(
+            log.alerts[0],
+            forge.tls.Alert.Description.unsupported_certificate);
+          // the pre-verification status passed to the verify callback is
+          // the EKU failure, not true
+          ASSERT.equal(log.verified[0][0],
+            forge.pki.certificateError.unsupported_certificate);
+          ASSERT.equal(log.verified[0][1], 0);
+          ASSERT.equal(log.verified[0][2], 1);
+        });
+
+      it('rejects a client certificate that only allows serverAuth',
+        function() {
+          var serverData = makeCert({
+            cn: 'server',
+            eku: {serverAuth: true}
+          });
+          var clientData = makeCert({
+            cn: 'client',
+            eku: {serverAuth: true}
+          });
+          var log = runMutualHandshake(serverData, clientData);
+          ASSERT.equal(log.connected, false);
+          ASSERT.ok(log.errors.length >= 1);
+          // the server rejects the client cert's purpose with this alert
+          ASSERT.ok(log.alerts.indexOf(
+            forge.tls.Alert.Description.unsupported_certificate) !== -1);
+        });
+
+      it('accepts a mutual handshake with role-correct EKUs', function() {
+        var serverData = makeCert({
+          cn: 'server',
+          eku: {serverAuth: true}
+        });
+        var clientData = makeCert({
+          cn: 'client',
+          eku: {clientAuth: true}
+        });
+        var log = runMutualHandshake(serverData, clientData);
+        ASSERT.equal(log.connected, true);
+        ASSERT.deepEqual(log.errors, []);
+      });
+
+      it('allows the application verify callback to override an EKU failure',
+        function() {
+          var server = makeCert({
+            cn: 'server',
+            eku: {clientAuth: true}
+          });
+          var log = runHandshake(server, {
+            verify: function() {
+              return true;
+            }
+          });
+          ASSERT.equal(log.connected, true);
+          ASSERT.deepEqual(log.errors, []);
+        });
+
+      it('can disable EKU enforcement via verifyOptions', function() {
+        var server = makeCert({
+          cn: 'server',
+          eku: {clientAuth: true}
+        });
+        var log = runHandshake(server, {
+          verifyOptions: {extendedKeyUsage: false}
+        });
+        ASSERT.equal(log.connected, true);
+        ASSERT.deepEqual(log.errors, []);
+      });
+
+      it('matches the host name against a dNSName SAN', function() {
+        var server = makeCert({
+          cn: 'other.example',
+          eku: {serverAuth: true},
+          altNames: [dnsName('example.com')]
+        });
+        var log = runHandshake(server, {
+          virtualHost: 'example.com',
+          verifyOptions: {checkHostName: true}
+        });
+        ASSERT.equal(log.connected, true);
+        ASSERT.deepEqual(log.errors, []);
+      });
+
+      it('matches a wildcard dNSName SAN for one label', function() {
+        var server = makeCert({
+          cn: 'server',
+          eku: {serverAuth: true},
+          altNames: [dnsName('*.example.com')]
+        });
+        var log = runHandshake(server, {
+          virtualHost: 'foo.example.com',
+          verifyOptions: {checkHostName: true}
+        });
+        ASSERT.equal(log.connected, true);
+        ASSERT.deepEqual(log.errors, []);
+      });
+
+      it('does not let a wildcard match multiple labels', function() {
+        var server = makeCert({
+          cn: 'server',
+          eku: {serverAuth: true},
+          altNames: [dnsName('*.example.com')]
+        });
+        var log = runHandshake(server, {
+          virtualHost: 'a.b.example.com',
+          verifyOptions: {checkHostName: true}
+        });
+        ASSERT.equal(log.connected, false);
+        ASSERT.equal(
+          log.alerts[0], forge.tls.Alert.Description.bad_certificate);
+        ASSERT.equal(log.verified[0][0],
+          forge.pki.certificateError.bad_certificate);
+      });
+
+      it('rejects a host name that matches no SAN', function() {
+        var server = makeCert({
+          cn: 'example.com',
+          eku: {serverAuth: true},
+          altNames: [dnsName('example.com')]
+        });
+        var log = runHandshake(server, {
+          virtualHost: 'attacker.com',
+          verifyOptions: {checkHostName: true}
+        });
+        ASSERT.equal(log.connected, false);
+        ASSERT.equal(
+          log.alerts[0], forge.tls.Alert.Description.bad_certificate);
+      });
+
+      it('ignores the common name when a SAN is present', function() {
+        var server = makeCert({
+          cn: 'example.com',
+          eku: {serverAuth: true},
+          altNames: [dnsName('other.example')]
+        });
+        var log = runHandshake(server, {
+          virtualHost: 'example.com',
+          verifyOptions: {checkHostName: true}
+        });
+        ASSERT.equal(log.connected, false);
+        ASSERT.equal(
+          log.alerts[0], forge.tls.Alert.Description.bad_certificate);
+      });
+
+      it('falls back to the common name when there is no SAN', function() {
+        var server = makeCert({
+          cn: 'example.com',
+          eku: {serverAuth: true}
+        });
+        var log = runHandshake(server, {
+          virtualHost: 'example.com',
+          verifyOptions: {checkHostName: true}
+        });
+        ASSERT.equal(log.connected, true);
+        ASSERT.deepEqual(log.errors, []);
+      });
+
+      it('matches an IP address against an iPAddress SAN only', function() {
+        var server = makeCert({
+          cn: '127.0.0.1',
+          eku: {serverAuth: true},
+          altNames: [ipName('127.0.0.1')]
+        });
+        var okLog = runHandshake(server, {
+          virtualHost: '127.0.0.1',
+          verifyOptions: {checkHostName: true}
+        });
+        ASSERT.equal(okLog.connected, true);
+
+        var badLog = runHandshake(server, {
+          virtualHost: '127.0.0.2',
+          verifyOptions: {checkHostName: true}
+        });
+        ASSERT.equal(badLog.connected, false);
+        ASSERT.equal(
+          badLog.alerts[0], forge.tls.Alert.Description.bad_certificate);
+      });
+
+      it('does not check the host name unless checkHostName is enabled',
+        function() {
+          var server = makeCert({
+            cn: 'example.com',
+            eku: {serverAuth: true},
+            altNames: [dnsName('example.com')]
+          });
+          // virtualHost set but checkHostName disabled: mismatched name OK
+          var log = runHandshake(server, {virtualHost: 'attacker.com'});
+          ASSERT.equal(log.connected, true);
+          ASSERT.deepEqual(log.errors, []);
+        });
+
+      it('still rejects a missing server certificate', function() {
+        // identity checks never replace the existing "no certificate"
+        // failure for a client
+        var server = makeCert({eku: {serverAuth: true}});
+        var end = {};
+        var errors = [];
+        end.client = forge.tls.createConnection({
+          server: false,
+          caStore: [server.cert],
+          verify: function(c, verified) {
+            return verified;
+          },
+          connected: function() {},
+          tlsDataReady: function(c) {
+            end.server.process(c.tlsData.getBytes());
+          },
+          dataReady: function() {},
+          closed: function() {},
+          error: function(c, error) {
+            errors.push(error.message);
+          }
+        });
+        end.server = forge.tls.createConnection({
+          server: true,
+          getCertificate: function() {
+            return server.cert;
+          },
+          getPrivateKey: function() {
+            return server.key;
+          },
+          connected: function() {},
+          tlsDataReady: function(c) {
+            // strip the Certificate message from the server's flight
+            var bytes = c.tlsData.getBytes();
+            var b = forge.util.createBuffer(bytes);
+            var out = '';
+            while(b.length() > 0) {
+              var contentType = b.getByte();
+              var version = b.getBytes(2);
+              var fragment = b.getBytes(b.getInt16());
+              if(contentType === forge.tls.ContentType.handshake) {
+                var h = forge.util.createBuffer(fragment);
+                fragment = '';
+                while(h.length() > 0) {
+                  var msgType = h.getByte();
+                  var length = h.getInt24();
+                  var body = h.getBytes(length);
+                  if(msgType !== forge.tls.HandshakeType.certificate) {
+                    fragment += String.fromCharCode(msgType) +
+                      forge.util.int32ToBytes(length).substr(1) + body;
+                  }
+                }
+              }
+              out += String.fromCharCode(contentType) + version +
+                forge.util.int32ToBytes(fragment.length).substr(2) +
+                fragment;
+            }
+            end.client.process(out);
+          },
+          dataReady: function() {},
+          closed: function() {},
+          error: function() {}
+        });
+        end.client.handshake();
+        ASSERT.deepEqual(errors,
+          ['No server certificate provided. Not enough security.']);
+        ASSERT.equal(end.client.fail, true);
+      });
+
+      it('rejects a missing client certificate when the server requires one',
+        function() {
+          var serverData = makeCert({
+            cn: 'server',
+            eku: {serverAuth: true}
+          });
+          var end = {};
+          var errors = [];
+          end.client = forge.tls.createConnection({
+            server: false,
+            caStore: [serverData.cert],
+            verify: function(c, verified) {
+              return verified;
+            },
+            connected: function() {},
+            // no getCertificate: client sends an empty Certificate message
+            tlsDataReady: function(c) {
+              end.server.process(c.tlsData.getBytes());
+            },
+            dataReady: function() {},
+            closed: function() {},
+            error: function(c, error) {
+              errors.push('client: ' + error.message);
+            }
+          });
+          end.server = forge.tls.createConnection({
+            server: true,
+            caStore: [],
+            verifyClient: true,
+            verify: function(c, verified) {
+              return verified;
+            },
+            connected: function() {},
+            getCertificate: function() {
+              return serverData.cert;
+            },
+            getPrivateKey: function() {
+              return serverData.key;
+            },
+            tlsDataReady: function(c) {
+              end.client.process(c.tlsData.getBytes());
+            },
+            dataReady: function() {},
+            closed: function() {},
+            error: function(c, error) {
+              errors.push('server: ' + error.message);
+            }
+          });
+          end.client.handshake();
+          ASSERT.equal(end.server.fail, true);
+          ASSERT.ok(errors.some(function(e) {
+            return /No client certificate provided/.test(e);
+          }), errors.join(' | '));
+        });
     });
   });
 })();

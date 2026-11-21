@@ -465,6 +465,46 @@ var server = forge.tls.createConnection({
 server.process(encryptedBytesFromClient);
 ```
 
+#### Peer identity and certificate purpose
+
+When a certificate chain is verified, the connection role, name matching,
+chain validity and certificate purpose are checked together so both ends
+reach the same trust decision:
+
+* A **client** requires the server's leaf certificate to be valid for
+  `serverAuth`; a **server** requires the client's leaf certificate (when one
+  is requested) to be valid for `clientAuth`. This follows the
+  `extKeyUsage` rules of RFC 5280 4.2.1.12: a certificate *without* an
+  `extKeyUsage` extension may be used for any purpose, while a certificate
+  *with* one must list the required purpose. This check is enabled by default
+  and can be disabled with `verifyOptions.extendedKeyUsage: false`.
+* A client can additionally check that the server certificate's identity
+  matches the host name it intended to reach (`virtualHost`). Set
+  `verifyOptions.checkHostName: true` to enable RFC 6125 matching against
+  `dNSName`/`iPAddress` subjectAltName entries, falling back to the common
+  name when the certificate has no subjectAltName. Wildcards are only
+  honored as the complete left-most label.
+
+```js
+var client = forge.tls.createConnection({
+  server: false,
+  caStore: trustedCerts,
+  virtualHost: 'example.com',
+  verifyOptions: {
+    // reject a leaf cert whose extKeyUsage lacks serverAuth (default: true)
+    extendedKeyUsage: true,
+    // reject a cert whose identity does not match 'example.com'
+    checkHostName: true
+  },
+  // the verify callback still runs after the checks above; its `verified`
+  // argument reflects them and it keeps the final accept/reject decision
+  verify: function(connection, verified, depth, certs) {
+    return verified;
+  },
+  // ...
+});
+```
+
 Connect to a TLS server using node's net.Socket:
 
 ```js
