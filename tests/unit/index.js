@@ -23,5 +23,6 @@ require('./des');
 require('./pkcs7');
 require('./pkcs12');
 require('./tls');
+require('./tls-state-machine');
 require('./ssh');
 require('../security');
