@@ -16,6 +16,7 @@ require('./rsa');
 require('./kem');
 require('./pkcs1');
 require('./x509');
+require('./x509-differential');
 require('./csr');
 require('./aes');
 require('./rc2');
